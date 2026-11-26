@@ -1,6 +1,3 @@
-v
-`default_nettype none
-
 module tinyfpga (
     input  logic       clk,
     input  logic       rst_n,
@@ -186,5 +183,3 @@ module tinyfpga (
                     ((~reg_mode) & lut_result);
 
 endmodule
-
-`default_nettype wire
