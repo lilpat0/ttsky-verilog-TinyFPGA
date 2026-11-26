@@ -4,7 +4,7 @@
 # defaults
 SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
-TOPLEVEL_LANG ?= SystemVerilog
+TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 
 # Order does not matter to Icarus, but keep the core first.
