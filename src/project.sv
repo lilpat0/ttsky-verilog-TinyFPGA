@@ -1,6 +1,3 @@
-
-`default_nettype none
-
 module tt_um_tinyfpga (
     input  logic [7:0] ui_in,
     output logic [7:0] uo_out,
@@ -71,5 +68,3 @@ module tt_um_tinyfpga (
     wire unused = &{ena, uio_in[7:3], 1'b0};
 
 endmodule
-
-`default_nettype wire
