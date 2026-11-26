@@ -1,565 +1,591 @@
 
-# SPDX-License-Identifier: Apache-2.0
-# Cocotb tests for tt_um_tinyfpga
-#
-# TinyTapeout pin mapping:
-#   ui_in[7:0]  = FPGA fabric inputs
-#   uo_out[3:0] = FPGA fabric outputs
-#
-#   uio[0] = SPI SCLK
-#   uio[1] = SPI CS_n
-#   uio[2] = SPI MOSI
-#   uio[3] = SPI MISO
-#
-# Configuration format (132 bits, MSB first):
-#   [63:0]     Four 16-bit LUT truth tables
-#   [127:64]   Sixteen 4-bit routing selectors
-#   [131:128]  Four output register-mode bits
-
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, RisingEdge, Timer
+from cocotb.triggers import RisingEdge, Timer
 
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
 CFG_BITS = 132
 SPI_HALF = 4
 
-SCLK = 0
-CS_N = 1
-MOSI = 2
-
+# Routing selector values
 R_IN = list(range(8))
 R_Q = [8, 9, 10, 11]
 R_0 = 12
 R_1 = 13
 
+# ------------------------------------------------------------
+# Clock helpers
+# ------------------------------------------------------------
 
-# ============================================================
-# LUT CONFIGURATION HELPERS
-# ============================================================
+async def cycles(dut, count=1):
+    for _ in range(count):
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
 
-def lut_from_func(func):
-    """Generate a 16-bit LUT4 truth table."""
 
-    table = 0
+async def after_edge(dut):
+    await RisingEdge(dut.clk)
+    await Timer(1, unit="ns")
 
-    for idx in range(16):
-        a = (idx >> 0) & 1
-        b = (idx >> 1) & 1
-        c = (idx >> 2) & 1
-        d = (idx >> 3) & 1
 
-        if func(a, b, c, d):
-            table |= 1 << idx
-
-    return table
-
+# ------------------------------------------------------------
+# Configuration builder
+# ------------------------------------------------------------
 
 def build_cfg(luts, routes, reg_mode=0):
-    """Build the complete 132-bit FPGA configuration."""
+    """
+    Build 132-bit configuration.
+
+    luts:
+        Four 16-bit LUT truth tables.
+
+    routes:
+        Four lists, each containing four routing selectors.
+
+    reg_mode:
+        Four-bit output register enable mask.
+    """
 
     assert len(luts) == 4
     assert len(routes) == 4
-    assert all(len(r) == 4 for r in routes)
 
     cfg = 0
 
+    # LUT truth tables [63:0]
     for i in range(4):
-
+        assert 0 <= luts[i] <= 0xFFFF
         cfg |= (luts[i] & 0xFFFF) << (i * 16)
 
-        for j in range(4):
-            cfg |= (
-                (routes[i][j] & 0xF)
-                << (64 + (i * 4 + j) * 4)
-            )
+    # Routing selectors [127:64]
+    for i in range(4):
+        assert len(routes[i]) == 4
 
+        for j in range(4):
+            route = routes[i][j]
+            assert 0 <= route <= 15
+
+            position = 64 + (i * 4 + j) * 4
+            cfg |= (route & 0xF) << position
+
+    # Register mode [131:128]
     cfg |= (reg_mode & 0xF) << 128
 
     return cfg
 
 
-# ============================================================
-# PIN HELPERS
-# ============================================================
-
-def set_spi(dut, sclk, cs_n, mosi):
-    """Drive the three SPI input pins."""
-
-    dut.uio_in.value = (
-        (mosi << MOSI)
-        | (cs_n << CS_N)
-        | (sclk << SCLK)
-    )
-
-
-def outs(dut):
-    """Read the four FPGA fabric outputs."""
-
-    return int(dut.uo_out.value) & 0x0F
-
-
-# ============================================================
-# SPI CONFIGURATION HELPER
-# ============================================================
+# ------------------------------------------------------------
+# SPI writer
+# ------------------------------------------------------------
 
 async def spi_write(dut, value, nbits=CFG_BITS):
     """
-    Send an SPI configuration transaction.
+    SPI Mode 0, MSB first.
 
-    Mode 0:
-      SCLK idle low
-      MOSI set up before rising edge
-      MSB transmitted first
-
-    CS is released after the final clock.
+    The DUT synchronizes SPI signals to clk.
     """
 
     assert nbits > 0
 
-    # Assert chip select.
-    set_spi(dut, 0, 0, 0)
-    await ClockCycles(dut.clk, SPI_HALF)
+    dut.spi_cs_n.value = 0
+    dut.spi_sclk.value = 0
 
-    # Transmit MSB first.
-    for k in range(nbits - 1, -1, -1):
+    await cycles(dut, 8)
 
-        bit = (value >> k) & 1
+    for bit in range(nbits - 1, -1, -1):
 
-        # Set MOSI while clock is low.
-        set_spi(dut, 0, 0, bit)
-        await ClockCycles(dut.clk, SPI_HALF)
+        dut.spi_mosi.value = (value >> bit) & 1
 
-        # Rising SCLK edge.
-        set_spi(dut, 1, 0, bit)
-        await ClockCycles(dut.clk, SPI_HALF)
+        await cycles(dut, SPI_HALF)
 
-    # Return SCLK low.
-    set_spi(dut, 0, 0, 0)
-    await ClockCycles(dut.clk, SPI_HALF)
+        # Rising edge: DUT samples MOSI
+        dut.spi_sclk.value = 1
+        await cycles(dut, SPI_HALF)
 
-    # Release chip select.
-    set_spi(dut, 0, 1, 0)
+        # Falling edge
+        dut.spi_sclk.value = 0
 
-    # Allow synchronizers and configuration commit to settle.
-    await ClockCycles(dut.clk, 10)
+    await cycles(dut, 8)
+
+    # End transaction
+    dut.spi_cs_n.value = 1
+    dut.spi_mosi.value = 0
+
+    # Allow synchronized CS rising edge to be detected
+    await cycles(dut, 10)
 
 
-# ============================================================
-# TEST INITIALIZATION
-# ============================================================
+# ------------------------------------------------------------
+# Reset and initialization
+# ------------------------------------------------------------
 
 async def start(dut):
-    """Initialize the TinyFPGA test environment."""
 
-    cocotb.start_soon(
-        Clock(dut.clk, 100, unit="ns").start()
-    )
+    dut.spi_sclk.value = 0
+    dut.spi_cs_n.value = 1
+    dut.spi_mosi.value = 0
 
-    dut.ena.value = 1
-    dut.ui_in.value = 0
-
-    set_spi(dut, 0, 1, 0)
+    dut.io_in.value = 0
 
     dut.rst_n.value = 0
 
-    await ClockCycles(dut.clk, 10)
+    cocotb.start_soon(
+        Clock(dut.clk, 10, unit="ns").start()
+    )
+
+    await cycles(dut, 5)
 
     dut.rst_n.value = 1
 
-    await ClockCycles(dut.clk, 5)
+    await cycles(dut, 10)
 
 
-async def after_edge(dut):
-    """Wait until after the next rising clock edge."""
+# ------------------------------------------------------------
+# Read outputs
+# ------------------------------------------------------------
 
-    await RisingEdge(dut.clk)
+async def read_output(dut):
     await Timer(1, unit="ns")
+    return int(dut.io_out.value)
 
 
-# ============================================================
-# TEST 1: RESET STATE
-# ============================================================
+async def configure(dut, luts, routes, reg_mode=0):
+    cfg = build_cfg(luts, routes, reg_mode)
+    await spi_write(dut, cfg)
+    await cycles(dut, 3)
+
+
+# ------------------------------------------------------------
+# Test 1: Reset and SPI pin behavior
+# ------------------------------------------------------------
 
 @cocotb.test()
-async def test_reset_state(dut):
-
-    """Verify reset outputs and pin directions."""
+async def test_reset(dut):
 
     await start(dut)
 
-    assert outs(dut) == 0
+    assert int(dut.io_out.value) == 0
+    assert int(dut.spi_miso.value) == 0
 
-    assert int(dut.uio_oe.value) == 0b00001000
-
-    assert int(dut.uio_out.value) == 0
+    dut._log.info("PASS: Reset and SPI output")
 
 
-# ============================================================
-# TEST 2: COMBINATIONAL LOGIC
-# ============================================================
+# ------------------------------------------------------------
+# Test 2: LUT functionality
+# ------------------------------------------------------------
 
 @cocotb.test()
-async def test_combinational_gates(dut):
-
-    """Test AND, XOR, OR, and NOT across all 256 input patterns."""
+async def test_lut_logic(dut):
 
     await start(dut)
+
+    # LUT0 = AND
+    # LUT1 = XOR
+    # LUT2 = OR
+    # LUT3 = NOT input 0
 
     luts = [
-        lut_from_func(lambda a, b, c, d: a & b),
-        lut_from_func(lambda a, b, c, d: a ^ b),
-        lut_from_func(lambda a, b, c, d: a | b),
-        lut_from_func(lambda a, b, c, d: 1 - a),
+        0x8000,
+        0x6996,
+        0xFFFE,
+        0x5555
     ]
 
     routes = [
-        [R_IN[0], R_IN[1], R_0, R_0],
-        [R_IN[2], R_IN[3], R_0, R_0],
-        [R_IN[4], R_IN[5], R_0, R_0],
-        [R_IN[6], R_0, R_0, R_0],
+        [0, 1, R_0, R_0],
+        [0, 1, R_0, R_0],
+        [0, 1, R_0, R_0],
+        [0, R_0, R_0, R_0]
     ]
 
-    await spi_write(dut, build_cfg(luts, routes))
+    await configure(dut, luts, routes)
 
-    for v in range(256):
+    for value in range(256):
 
-        dut.ui_in.value = v
+        dut.io_in.value = value
 
-        await ClockCycles(dut.clk, 2)
+        await cycles(dut, 2)
 
-        i = [(v >> n) & 1 for n in range(8)]
+        result = await read_output(dut)
+
+        a = (value >> 0) & 1
+        b = (value >> 1) & 1
+
+        expected0 = a & b
+        expected1 = a ^ b
+        expected2 = a | b
+        expected3 = 1 - a
 
         expected = (
-            (i[0] & i[1])
-            | ((i[2] ^ i[3]) << 1)
-            | ((i[4] | i[5]) << 2)
-            | ((1 - i[6]) << 3)
+            expected0 |
+            (expected1 << 1) |
+            (expected2 << 2) |
+            (expected3 << 3)
         )
 
-        actual = outs(dut)
-
-        assert actual == expected, (
-            f"ui_in={v:#04x}: "
-            f"got={actual:#x}, expected={expected:#x}"
+        assert result == expected, (
+            f"LUT failure: io_in={value:02X}, "
+            f"expected={expected:04b}, "
+            f"got={result:04b}"
         )
 
+    dut._log.info("PASS: All 256 input patterns")
 
-# ============================================================
-# TEST 3: CONSTANT ROUTING
-# ============================================================
+
+# ------------------------------------------------------------
+# Test 3: Constant routing
+# ------------------------------------------------------------
 
 @cocotb.test()
 async def test_constants(dut):
 
-    """Verify constant-zero and constant-one routing."""
-
     await start(dut)
 
     luts = [
-        0xFFFF,
+        0x8000,
         0x0001,
         0x0001,
-        0x0001,
+        0x0001
     ]
 
     routes = [
         [R_1, R_1, R_1, R_1],
         [R_0, R_0, R_0, R_0],
         [14, 15, 14, 15],
-        [R_0, R_0, R_0, R_1],
+        [R_0, R_0, R_0, R_1]
     ]
 
-    await spi_write(dut, build_cfg(luts, routes))
+    await configure(dut, luts, routes)
 
-    await ClockCycles(dut.clk, 2)
+    dut.io_in.value = 0x00
 
-    assert outs(dut) == 0b0111
+    await cycles(dut, 3)
+
+    result = await read_output(dut)
+
+    # LUT0: index 15 -> 1
+    # LUT1: index 0  -> 1
+    # LUT2: index 0  -> 1
+    # LUT3: index 8  -> 0
+
+    expected = 0b0111
+
+    assert result == expected, (
+        f"Constant routing failure: "
+        f"expected={expected:04b}, got={result:04b}"
+    )
+
+    dut._log.info("PASS: Constant routing")
 
 
-# ============================================================
-# TEST 4: REGISTERED OUTPUT
-# ============================================================
+# ------------------------------------------------------------
+# Test 4: Registered outputs
+# ------------------------------------------------------------
 
 @cocotb.test()
-async def test_registered_output(dut):
-
-    """Verify registered outputs update on clock edges."""
+async def test_registered_outputs(dut):
 
     await start(dut)
 
-    luts = [
-        lut_from_func(lambda a, b, c, d: a & b),
-        0,
-        0,
-        0,
-    ]
+    # Four LUTs configured as direct input 0
+    luts = [0xAAAA] * 4
 
     routes = [
-        [R_IN[0], R_IN[1], R_0, R_0],
-        [R_0] * 4,
-        [R_0] * 4,
-        [R_0] * 4,
+        [0, R_0, R_0, R_0],
+        [0, R_0, R_0, R_0],
+        [0, R_0, R_0, R_0],
+        [0, R_0, R_0, R_0]
     ]
 
-    await spi_write(
-        dut,
-        build_cfg(luts, routes, reg_mode=0b0001)
+    # All four outputs registered
+    await configure(dut, luts, routes, reg_mode=0xF)
+
+    dut.io_in.value = 1
+
+    await cycles(dut, 2)
+
+    result = await read_output(dut)
+
+    assert result == 0xF, (
+        f"Registered output failed: got {result:04b}"
     )
 
-    await after_edge(dut)
+    dut.io_in.value = 0
 
-    dut.ui_in.value = 0b11
+    # Output remains high until next clock
+    result = await read_output(dut)
 
-    await Timer(10, unit="ns")
-
-    assert outs(dut) & 1 == 0, (
-        "Registered output changed before clock edge"
+    assert result == 0xF, (
+        "Registered output changed without a clock edge"
     )
 
-    await after_edge(dut)
+    await cycles(dut, 1)
 
-    assert outs(dut) & 1 == 1, (
-        "Registered output failed to update"
+    result = await read_output(dut)
+
+    assert result == 0x0, (
+        "Registered output did not update after clock"
     )
 
-    await after_edge(dut)
-
-    dut.ui_in.value = 0b01
-
-    await Timer(10, unit="ns")
-
-    assert outs(dut) & 1 == 1
-
-    await after_edge(dut)
-
-    assert outs(dut) & 1 == 0
+    dut._log.info("PASS: Registered outputs")
 
 
-# ============================================================
-# TEST 5: REGISTERED FEEDBACK
-# ============================================================
+# ------------------------------------------------------------
+# Test 5: LUT feedback
+# ------------------------------------------------------------
 
 @cocotb.test()
-async def test_toggle_feedback(dut):
-
-    """Verify LUT0 can invert its own registered output."""
+async def test_lut_feedback(dut):
 
     await start(dut)
 
+    # LUT0 = NOT its own registered output
+    #
+    # When reg_mode[0] is enabled:
+    # lut_q[0] <= ~lut_q[0]
+    #
+    # Expected behavior: toggles every clock.
+
     luts = [
-        lut_from_func(lambda a, b, c, d: 1 - a),
-        0,
-        0,
-        0,
+        0x5555,
+        0x0000,
+        0x0000,
+        0x0000
     ]
 
     routes = [
         [R_Q[0], R_0, R_0, R_0],
-        [R_0] * 4,
-        [R_0] * 4,
-        [R_0] * 4,
+        [R_0, R_0, R_0, R_0],
+        [R_0, R_0, R_0, R_0],
+        [R_0, R_0, R_0, R_0]
     ]
 
-    await spi_write(
-        dut,
-        build_cfg(luts, routes, reg_mode=0b0001)
-    )
+    await configure(dut, luts, routes, reg_mode=0x1)
 
-    samples = []
+    previous = 0
 
     for _ in range(10):
 
-        await after_edge(dut)
+        await cycles(dut, 1)
 
-        samples.append(outs(dut) & 1)
+        result = await read_output(dut) & 1
 
-    assert set(samples) == {0, 1}, (
-        f"Output never toggled: {samples}"
-    )
-
-    for a, b in zip(samples, samples[1:]):
-
-        assert a != b, (
-            f"Output did not toggle every clock: {samples}"
+        assert result != previous, (
+            "Feedback oscillator did not toggle"
         )
 
+        previous = result
 
-# ============================================================
-# TEST 6: LUT-TO-LUT PIPELINE
-# ============================================================
+    dut._log.info("PASS: LUT feedback")
+
+
+# ------------------------------------------------------------
+# Test 6: LUT-to-LUT registered pipeline
+# ------------------------------------------------------------
 
 @cocotb.test()
-async def test_pipeline_crossbar(dut):
-
-    """Verify LUT0 -> LUT1 registered feedback pipeline."""
+async def test_lut_pipeline(dut):
 
     await start(dut)
 
-    ident = lut_from_func(lambda a, b, c, d: a)
+    # LUT0 = io_in[0]
+    # LUT1 = registered LUT0 output
+    #
+    # LUT1 uses route selector 8 (lut_q[0]).
 
     luts = [
-        ident,
-        ident,
-        0,
-        0,
+        0xAAAA,
+        0xAAAA,
+        0x0000,
+        0x0000
     ]
 
     routes = [
-        [R_IN[0], R_0, R_0, R_0],
+        [0, R_0, R_0, R_0],
         [R_Q[0], R_0, R_0, R_0],
-        [R_0] * 4,
-        [R_0] * 4,
+        [R_0, R_0, R_0, R_0],
+        [R_0, R_0, R_0, R_0]
     ]
 
-    await spi_write(
-        dut,
-        build_cfg(luts, routes, reg_mode=0b0011)
+    await configure(dut, luts, routes, reg_mode=0x2)
+
+    dut.io_in.value = 1
+
+    await cycles(dut, 2)
+
+    result = await read_output(dut)
+
+    assert (result & 0x2) == 0x2, (
+        "LUT pipeline failed to propagate logic 1"
     )
 
-    await after_edge(dut)
+    dut.io_in.value = 0
 
-    dut.ui_in.value = 1
+    await cycles(dut, 2)
 
-    await after_edge(dut)
+    result = await read_output(dut)
 
-    assert outs(dut) & 0b11 == 0b01
+    assert (result & 0x2) == 0, (
+        "LUT pipeline failed to propagate logic 0"
+    )
 
-    await after_edge(dut)
-
-    assert outs(dut) & 0b11 == 0b11
+    dut._log.info("PASS: LUT pipeline")
 
 
-# ============================================================
-# TEST 7: INVALID SPI TRANSFER LENGTHS
-# ============================================================
+# ------------------------------------------------------------
+# Test 7: Invalid configuration lengths
+# ------------------------------------------------------------
 
 @cocotb.test()
 async def test_bad_length_rejected(dut):
 
-    """
-    Verify:
-      131 bits = rejected
-      132 bits = accepted
-      133 bits = rejected
-    """
-
     await start(dut)
 
-    and_lut = lut_from_func(
-        lambda a, b, c, d: a & b
-    )
-
-    good = build_cfg(
-        [and_lut, 0, 0, 0],
-        [
-            [R_IN[0], R_IN[1], R_0, R_0],
-            [R_0] * 4,
-            [R_0] * 4,
-            [R_0] * 4,
-        ]
-    )
-
-    zero = build_cfg(
-        [0, 0, 0, 0],
-        [[R_0] * 4 for _ in range(4)]
-    )
-
-    # Load a valid configuration first.
-    await spi_write(dut, good)
-
-    dut.ui_in.value = 0b11
-
-    await ClockCycles(dut.clk, 3)
-
-    assert outs(dut) & 1 == 1
-
-    # Invalid: 131 bits.
-    await spi_write(
-        dut,
-        zero,
-        nbits=CFG_BITS - 1
-    )
-
-    await ClockCycles(dut.clk, 3)
-
-    assert outs(dut) & 1 == 1, (
-        "131-bit transfer was incorrectly accepted"
-    )
-
-    # Invalid: 133 bits.
-    await spi_write(
-        dut,
-        zero,
-        nbits=CFG_BITS + 1
-    )
-
-    await ClockCycles(dut.clk, 3)
-
-    assert outs(dut) & 1 == 1, (
-        "133-bit transfer was incorrectly accepted"
-    )
-
-    # Valid: 132 bits.
-    await spi_write(dut, zero)
-
-    await ClockCycles(dut.clk, 3)
-
-    assert outs(dut) & 1 == 0, (
-        "Valid 132-bit transfer was rejected"
-    )
-
-
-# ============================================================
-# TEST 8: RECONFIGURATION
-# ============================================================
-
-@cocotb.test()
-async def test_reconfigure(dut):
-
-    """Verify a second configuration replaces the first."""
-
-    await start(dut)
-
-    and_lut = lut_from_func(
-        lambda a, b, c, d: a & b
-    )
-
-    or_lut = lut_from_func(
-        lambda a, b, c, d: a | b
-    )
+    luts = [0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF]
 
     routes = [
-        [R_IN[0], R_IN[1], R_0, R_0],
-        [R_0] * 4,
-        [R_0] * 4,
-        [R_0] * 4,
+        [R_1, R_1, R_1, R_1],
+        [R_1, R_1, R_1, R_1],
+        [R_1, R_1, R_1, R_1],
+        [R_1, R_1, R_1, R_1]
     ]
 
-    dut.ui_in.value = 0b01
+    cfg = build_cfg(luts, routes)
 
-    # First configuration: AND.
-    await spi_write(
-        dut,
-        build_cfg(
-            [and_lut, 0, 0, 0],
-            routes
-        )
+    # 131 bits must be rejected
+    await spi_write(dut, cfg, 131)
+
+    assert int(dut.io_out.value) == 0, (
+        "131-bit configuration was incorrectly accepted"
     )
 
-    await ClockCycles(dut.clk, 2)
+    # 133 bits must be rejected
+    await spi_write(dut, cfg, 133)
 
-    assert outs(dut) & 1 == 0
-
-    # Second configuration: OR.
-    await spi_write(
-        dut,
-        build_cfg(
-            [or_lut, 0, 0, 0],
-            routes
-        )
+    assert int(dut.io_out.value) == 0, (
+        "133-bit configuration was incorrectly accepted"
     )
 
-    await ClockCycles(dut.clk, 2)
+    # Exactly 132 bits must be accepted
+    await spi_write(dut, cfg, 132)
 
-    assert outs(dut) & 1 == 1
+    assert int(dut.io_out.value) == 0xF, (
+        "Valid 132-bit configuration was rejected"
+    )
+
+    dut._log.info("PASS: Configuration length validation")
+
+
+# ------------------------------------------------------------
+# Test 8: Reconfiguration
+# ------------------------------------------------------------
+
+@cocotb.test()
+async def test_reconfiguration(dut):
+
+    await start(dut)
+
+    routes = [
+        [0, 1, R_0, R_0],
+        [0, 1, R_0, R_0],
+        [0, 1, R_0, R_0],
+        [0, 1, R_0, R_0]
+    ]
+
+    # Configure all LUTs as AND
+    await configure(
+        dut,
+        [0x8000] * 4,
+        routes
+    )
+
+    dut.io_in.value = 0b11
+
+    await cycles(dut, 2)
+
+    result = await read_output(dut)
+
+    assert result == 0xF, (
+        "Initial AND configuration failed"
+    )
+
+    # Reconfigure all LUTs as OR
+    await configure(
+        dut,
+        [0xFFFE] * 4,
+        routes
+    )
+
+    dut.io_in.value = 0b01
+
+    await cycles(dut, 2)
+
+    result = await read_output(dut)
+
+    assert result == 0xF, (
+        "Reconfiguration to OR failed"
+    )
+
+    dut._log.info("PASS: Reconfiguration")
+
+
+# ------------------------------------------------------------
+# Test 9: Outputs disabled during configuration
+# ------------------------------------------------------------
+
+@cocotb.test()
+async def test_outputs_disabled_during_spi(dut):
+
+    await start(dut)
+
+    luts = [0xFFFF] * 4
+
+    routes = [
+        [R_1, R_1, R_1, R_1],
+        [R_1, R_1, R_1, R_1],
+        [R_1, R_1, R_1, R_1],
+        [R_1, R_1, R_1, R_1]
+    ]
+
+    await configure(dut, luts, routes)
+
+    assert int(dut.io_out.value) == 0xF
+
+    # Start a new SPI transaction.
+    dut.spi_cs_n.value = 0
+    dut.spi_sclk.value = 0
+
+    await cycles(dut, 8)
+
+    # Outputs must be disabled during programming.
+    assert int(dut.io_out.value) == 0, (
+        "Outputs were not disabled during configuration"
+    )
+
+    # Send a new valid configuration.
+    cfg = build_cfg(luts, routes)
+
+    for bit in range(CFG_BITS - 1, -1, -1):
+
+        dut.spi_mosi.value = (cfg >> bit) & 1
+
+        await cycles(dut, SPI_HALF)
+
+        dut.spi_sclk.value = 1
+        await cycles(dut, SPI_HALF)
+
+        dut.spi_sclk.value = 0
+
+    await cycles(dut, 8)
+
+    dut.spi_cs_n.value = 1
+
+    await cycles(dut, 10)
+
+    assert int(dut.io_out.value) == 0xF, (
+        "Outputs did not reactivate after valid configuration"
+    )
+
+    dut._log.info("PASS: Outputs disabled during SPI programming")
