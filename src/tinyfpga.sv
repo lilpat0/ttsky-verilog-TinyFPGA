@@ -1,4 +1,3 @@
-
 `default_nettype none
 
 module tinyfpga (
@@ -16,10 +15,19 @@ module tinyfpga (
     output logic [3:0] io_out
 );
 
-    localparam integer CFG_BITS = 222;
+    // =========================================================
+    // COMPACT FPGA ARCHITECTURE
+    // 4 LUT4s
+    // 4 optional LUT output registers
+    // 1 x 8-bit counter
+    // 1 x 8-bit shift register
+    // 1 PWM channel
+    // =========================================================
+
+    localparam integer CFG_BITS = 164;
 
     // =========================================================
-    // SPI CONFIGURATION
+    // SPI SYNCHRONIZATION
     // =========================================================
 
     logic [2:0] sclk_s;
@@ -48,17 +56,21 @@ module tinyfpga (
             cs_s   <= {cs_s[1:0], spi_cs_n};
             mosi_s <= {mosi_s[0], spi_mosi};
 
+            // Receive configuration bits.
             if (cs_active && sclk_rise && bit_cnt < CFG_BITS)
                 cfg <= {cfg[CFG_BITS-2:0], mosi_s[1]};
 
+            // Count all received bits.
             if (!cs_active)
                 bit_cnt <= 8'd0;
             else if (sclk_rise && bit_cnt != 8'hFF)
                 bit_cnt <= bit_cnt + 8'd1;
 
+            // Disable the fabric during configuration.
             if (cs_active)
                 cfg_valid <= 1'b0;
 
+            // Accept only exactly 164 bits.
             if (cs_rise)
                 cfg_valid <= (bit_cnt == CFG_BITS);
 
@@ -68,127 +80,92 @@ module tinyfpga (
     assign spi_miso = 1'b0;
 
     // =========================================================
-    // CONFIGURATION MAP
+    // CONFIGURATION MAP: 164 BITS
+    // =========================================================
+    //
+    // [ 63:  0] Four LUT truth tables
+    // [127: 64] Sixteen 4-bit routing selectors
+    // [131:128] Four LUT register modes
+    //
+    // [139:132] Shared counter/PWM period
+    // [140]     Counter enable
+    //
+    // [148:141] Shift-register initial value
+    // [152:149] Shift-register input selector
+    // [153]     Shift-register enable
+    // [154]     Shift direction
+    //
+    // [162:155] PWM duty cycle
+    // [163]     PWM enable
+    //
     // =========================================================
 
-    // 0-63       : Four LUT4 truth tables
-    // 64-143     : Sixteen 5-bit LUT routing selectors
-    // 144-147    : Four LUT register modes
-    //
-    // 148-155    : Counter 0 period
-    // 156        : Counter 0 enable
-    // 157-164    : Counter 1 period
-    // 165        : Counter 1 enable
-    //
-    // 166-173    : Shift register 0 initial value
-    // 174-178    : Shift register 0 input selector
-    // 179        : Shift register 0 enable
-    // 180        : Shift register 0 direction
-    //
-    // 181-188    : Shift register 1 initial value
-    // 189-193    : Shift register 1 input selector
-    // 194        : Shift register 1 enable
-    // 195        : Shift register 1 direction
-    //
-    // 196-203    : PWM shared period
-    // 204-211    : PWM 0 duty cycle
-    // 212        : PWM 0 enable
-    // 213-220    : PWM 1 duty cycle
-    // 221        : PWM 1 enable
-
-    wire [3:0] reg_mode = cfg[147:144];
+    wire [3:0] reg_mode = cfg[131:128];
 
     // =========================================================
-    // FABRIC RESOURCES
+    // FABRIC STATE
     // =========================================================
 
     logic [3:0] lut_q;
     wire  [3:0] lut_result;
 
-    logic [7:0] counter0;
-    logic [7:0] counter1;
+    logic [7:0] timebase_count;
+    logic       counter_tick;
 
-    logic counter0_tick;
-    logic counter1_tick;
+    logic [7:0] shift_reg;
 
-    logic [7:0] shift0;
-    logic [7:0] shift1;
+    wire pwm_out;
 
-    logic [7:0] pwm_count;
-
-    wire pwm0;
-    wire pwm1;
+    logic cfg_valid_d;
 
     // =========================================================
-    // SHARED ROUTING NETWORK
+    // ROUTING NETWORK
     // =========================================================
-
-    // Selector map:
     //
-    //  0-7  : External inputs
-    //  8-11 : LUT registered outputs
-    //  12   : Counter 0 MSB
-    //  13   : Counter 1 MSB
-    //  14   : Shift register 0 MSB
-    //  15   : Shift register 1 MSB
-    //  16   : PWM 0
-    //  17   : PWM 1
-    //  18   : Counter 0 terminal pulse
-    //  19   : Counter 1 terminal pulse
-    //  20   : Shift register 0 LSB
-    //  21   : Shift register 1 LSB
-    //  31   : Logic 1
-    //  Other : Logic 0
+    // 0-7  : External inputs
+    // 8-11 : Registered LUT outputs
+    // 12   : Counter MSB
+    // 13   : Counter terminal pulse
+    // 14   : Shift-register MSB
+    // 15   : PWM output
+    //
+    // Constants can be implemented using LUT truth tables:
+    // 16'h0000 = constant zero
+    // 16'hFFFF = constant one
+    //
+    // =========================================================
 
     function automatic logic route_select (
-        input logic [4:0] select,
+        input logic [3:0] select,
         input logic [7:0] external_inputs,
-        input logic [3:0] internal_outputs,
-        input logic c0_msb,
-        input logic c1_msb,
-        input logic c0_tick,
-        input logic c1_tick,
-        input logic s0_msb,
-        input logic s1_msb,
-        input logic s0_lsb,
-        input logic s1_lsb,
-        input logic p0,
-        input logic p1
+        input logic [3:0] lut_outputs,
+        input logic       counter_msb,
+        input logic       counter_event,
+        input logic       shift_msb,
+        input logic       pwm_value
     );
 
         begin
             case (select)
 
-                5'd0: route_select = external_inputs[0];
-                5'd1: route_select = external_inputs[1];
-                5'd2: route_select = external_inputs[2];
-                5'd3: route_select = external_inputs[3];
-                5'd4: route_select = external_inputs[4];
-                5'd5: route_select = external_inputs[5];
-                5'd6: route_select = external_inputs[6];
-                5'd7: route_select = external_inputs[7];
+                4'd0:  route_select = external_inputs[0];
+                4'd1:  route_select = external_inputs[1];
+                4'd2:  route_select = external_inputs[2];
+                4'd3:  route_select = external_inputs[3];
+                4'd4:  route_select = external_inputs[4];
+                4'd5:  route_select = external_inputs[5];
+                4'd6:  route_select = external_inputs[6];
+                4'd7:  route_select = external_inputs[7];
 
-                5'd8:  route_select = internal_outputs[0];
-                5'd9:  route_select = internal_outputs[1];
-                5'd10: route_select = internal_outputs[2];
-                5'd11: route_select = internal_outputs[3];
+                4'd8:  route_select = lut_outputs[0];
+                4'd9:  route_select = lut_outputs[1];
+                4'd10: route_select = lut_outputs[2];
+                4'd11: route_select = lut_outputs[3];
 
-                5'd12: route_select = c0_msb;
-                5'd13: route_select = c1_msb;
-
-                5'd14: route_select = s0_msb;
-                5'd15: route_select = s1_msb;
-
-                5'd16: route_select = p0;
-                5'd17: route_select = p1;
-
-                5'd18: route_select = c0_tick;
-                5'd19: route_select = c1_tick;
-
-                5'd20: route_select = s0_lsb;
-                5'd21: route_select = s1_lsb;
-
-                5'd31: route_select = 1'b1;
+                4'd12: route_select = counter_msb;
+                4'd13: route_select = counter_event;
+                4'd14: route_select = shift_msb;
+                4'd15: route_select = pwm_value;
 
                 default: route_select = 1'b0;
 
@@ -198,185 +175,104 @@ module tinyfpga (
     endfunction
 
     // =========================================================
-    // PWM GENERATORS
+    // SHARED COUNTER / PWM TIMEBASE
     // =========================================================
 
-    // Shared programmable timebase.
-    // Each PWM channel has an independent duty cycle.
+    // Period = configured value + 1 clock cycles.
+    // Counter and PWM share the same timebase.
 
     always_ff @(posedge clk) begin
 
         if (!rst_n || !cfg_valid) begin
-            pwm_count <= 8'd0;
-        end
-        else if (pwm_count >= cfg[203:196]) begin
-            pwm_count <= 8'd0;
-        end
-        else begin
-            pwm_count <= pwm_count + 8'd1;
+            timebase_count <= 8'd0;
+            counter_tick   <= 1'b0;
         end
 
+        else if (!cfg_valid_d) begin
+            timebase_count <= 8'd0;
+            counter_tick   <= 1'b0;
+        end
+
+        else begin
+
+            counter_tick <= 1'b0;
+
+            if (cfg[140] || cfg[163]) begin
+
+                if (timebase_count >= cfg[139:132]) begin
+
+                    timebase_count <= 8'd0;
+
+                    if (cfg[140])
+                        counter_tick <= 1'b1;
+
+                end else begin
+
+                    timebase_count <= timebase_count + 8'd1;
+
+                end
+
+            end else begin
+
+                timebase_count <= 8'd0;
+
+            end
+
+        end
     end
 
-    assign pwm0 =
-        cfg_valid &&
-        cfg[212] &&
-        ((cfg[211:204] == 8'hFF) ||
-         (pwm_count < cfg[211:204]));
-
-    assign pwm1 =
-        cfg_valid &&
-        cfg[221] &&
-        ((cfg[220:213] == 8'hFF) ||
-         (pwm_count < cfg[220:213]));
-
     // =========================================================
-    // COUNTERS
+    // SHIFT REGISTER INPUT
     // =========================================================
 
-    logic cfg_valid_d;
+    wire shift_input = route_select(
+        cfg[152:149],
+        io_in,
+        lut_q,
+        timebase_count[7],
+        counter_tick,
+        shift_reg[7],
+        pwm_out
+    );
+
+    // =========================================================
+    // ONE CONFIGURABLE 8-BIT SHIFT REGISTER
+    // =========================================================
 
     always_ff @(posedge clk) begin
 
-        if (!rst_n) begin
-            cfg_valid_d  <= 1'b0;
+        if (!rst_n || !cfg_valid) begin
 
-            counter0     <= 8'd0;
-            counter1     <= 8'd0;
+            shift_reg <= 8'd0;
 
-            counter0_tick <= 1'b0;
-            counter1_tick <= 1'b0;
-
-            shift0 <= 8'd0;
-            shift1 <= 8'd0;
-
-        end else begin
-
-            cfg_valid_d <= cfg_valid;
-
-            if (!cfg_valid) begin
-
-                counter0 <= 8'd0;
-                counter1 <= 8'd0;
-
-                counter0_tick <= 1'b0;
-                counter1_tick <= 1'b0;
-
-                shift0 <= 8'd0;
-                shift1 <= 8'd0;
-
-            end
-
-            // Initialize programmable resources once
-            // a complete configuration is accepted.
-            else if (!cfg_valid_d) begin
-
-                counter0 <= 8'd0;
-                counter1 <= 8'd0;
-
-                counter0_tick <= 1'b0;
-                counter1_tick <= 1'b0;
-
-                shift0 <= cfg[173:166];
-                shift1 <= cfg[188:181];
-
-            end
-
-            else begin
-
-                // Counter 0
-                counter0_tick <= 1'b0;
-
-                if (cfg[156]) begin
-                    if ((cfg[155:148] == 8'd0) ||
-                        (counter0 >= cfg[155:148] - 8'd1)) begin
-
-                        counter0 <= 8'd0;
-                        counter0_tick <= 1'b1;
-
-                    end else begin
-                        counter0 <= counter0 + 8'd1;
-                    end
-                end else begin
-                    counter0 <= 8'd0;
-                end
-
-                // Counter 1
-                counter1_tick <= 1'b0;
-
-                if (cfg[165]) begin
-                    if ((cfg[164:157] == 8'd0) ||
-                        (counter1 >= cfg[164:157] - 8'd1)) begin
-
-                        counter1 <= 8'd0;
-                        counter1_tick <= 1'b1;
-
-                    end else begin
-                        counter1 <= counter1 + 8'd1;
-                    end
-                end else begin
-                    counter1 <= 8'd0;
-                end
-
-                // Shift register 0
-                if (cfg[179]) begin
-                    if (cfg[180])
-                        shift0 <= {
-                            route_select(
-                                cfg[178:174], io_in, lut_q,
-                                counter0[7], counter1[7],
-                                counter0_tick, counter1_tick,
-                                shift0[7], shift1[7],
-                                shift0[0], shift1[0],
-                                pwm0, pwm1
-                            ),
-                            shift0[7:1]
-                        };
-                    else
-                        shift0 <= {
-                            shift0[6:0],
-                            route_select(
-                                cfg[178:174], io_in, lut_q,
-                                counter0[7], counter1[7],
-                                counter0_tick, counter1_tick,
-                                shift0[7], shift1[7],
-                                shift0[0], shift1[0],
-                                pwm0, pwm1
-                            )
-                        };
-                end
-
-                // Shift register 1
-                if (cfg[194]) begin
-                    if (cfg[195])
-                        shift1 <= {
-                            route_select(
-                                cfg[193:189], io_in, lut_q,
-                                counter0[7], counter1[7],
-                                counter0_tick, counter1_tick,
-                                shift0[7], shift1[7],
-                                shift0[0], shift1[0],
-                                pwm0, pwm1
-                            ),
-                            shift1[7:1]
-                        };
-                    else
-                        shift1 <= {
-                            shift1[6:0],
-                            route_select(
-                                cfg[193:189], io_in, lut_q,
-                                counter0[7], counter1[7],
-                                counter0_tick, counter1_tick,
-                                shift0[7], shift1[7],
-                                shift0[0], shift1[0],
-                                pwm0, pwm1
-                            )
-                        };
-                end
-
-            end
         end
+
+        else if (!cfg_valid_d) begin
+
+            shift_reg <= cfg[148:141];
+
+        end
+
+        else if (cfg[153]) begin
+
+            if (cfg[154])
+                shift_reg <= {shift_input, shift_reg[7:1]};
+            else
+                shift_reg <= {shift_reg[6:0], shift_input};
+
+        end
+
     end
+
+    // =========================================================
+    // PWM GENERATOR
+    // =========================================================
+
+    assign pwm_out =
+        cfg_valid &&
+        cfg[163] &&
+        ((&cfg[162:155]) ||
+         (timebase_count < cfg[162:155]));
 
     // =========================================================
     // FOUR LUT4 BLOCKS
@@ -386,40 +282,49 @@ module tinyfpga (
     genvar j;
 
     generate
+
         for (i = 0; i < 4; i = i + 1) begin : g_lut
 
-            wire [3:0] sel_in;
-            wire [15:0] table_bits;
+            wire [3:0] lut_inputs;
+            wire [15:0] truth_table;
 
-            assign table_bits = cfg[i*16 +: 16];
+            assign truth_table = cfg[i*16 +: 16];
 
             for (j = 0; j < 4; j = j + 1) begin : g_input
 
-                assign sel_in[j] = route_select(
-                    cfg[64 + (i*4+j)*5 +: 5],
+                assign lut_inputs[j] = route_select(
+                    cfg[64 + (i*4+j)*4 +: 4],
                     io_in,
                     lut_q,
-                    counter0[7],
-                    counter1[7],
-                    counter0_tick,
-                    counter1_tick,
-                    shift0[7],
-                    shift1[7],
-                    shift0[0],
-                    shift1[0],
-                    pwm0,
-                    pwm1
+                    timebase_count[7],
+                    counter_tick,
+                    shift_reg[7],
+                    pwm_out
                 );
 
             end
 
-            assign lut_result[i] = table_bits[sel_in];
+            assign lut_result[i] = truth_table[lut_inputs];
 
         end
+
     endgenerate
 
     // =========================================================
-    // LUT OUTPUT REGISTERS
+    // CONFIGURATION VALID STATE
+    // =========================================================
+
+    always_ff @(posedge clk) begin
+
+        if (!rst_n)
+            cfg_valid_d <= 1'b0;
+        else
+            cfg_valid_d <= cfg_valid;
+
+    end
+
+    // =========================================================
+    // OPTIONAL LUT OUTPUT REGISTERS
     // =========================================================
 
     always_ff @(posedge clk) begin
