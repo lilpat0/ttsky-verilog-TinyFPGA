@@ -25,6 +25,7 @@ module tinyfpga (
     // =========================================================
 
     localparam integer CFG_BITS = 164;
+    localparam logic [7:0] CFG_BITS_U8 = 8'd164;
 
     // =========================================================
     // SPI SYNCHRONIZATION
@@ -57,7 +58,8 @@ module tinyfpga (
             mosi_s <= {mosi_s[0], spi_mosi};
 
             // Receive configuration bits.
-            if (cs_active && sclk_rise && bit_cnt < CFG_BITS)
+            // Explicit 8-bit comparison avoids width warnings.
+            if (cs_active && sclk_rise && bit_cnt < CFG_BITS_U8)
                 cfg <= {cfg[CFG_BITS-2:0], mosi_s[1]};
 
             // Count all received bits.
@@ -66,13 +68,13 @@ module tinyfpga (
             else if (sclk_rise && bit_cnt != 8'hFF)
                 bit_cnt <= bit_cnt + 8'd1;
 
-            // Disable the fabric during configuration.
+            // Disable fabric during configuration.
             if (cs_active)
                 cfg_valid <= 1'b0;
 
             // Accept only exactly 164 bits.
             if (cs_rise)
-                cfg_valid <= (bit_cnt == CFG_BITS);
+                cfg_valid <= (bit_cnt == CFG_BITS_U8);
 
         end
     end
@@ -97,8 +99,6 @@ module tinyfpga (
     //
     // [162:155] PWM duty cycle
     // [163]     PWM enable
-    //
-    // =========================================================
 
     wire [3:0] reg_mode = cfg[131:128];
 
@@ -129,11 +129,9 @@ module tinyfpga (
     // 14   : Shift-register MSB
     // 15   : PWM output
     //
-    // Constants can be implemented using LUT truth tables:
+    // Constants can be implemented through LUT truth tables:
     // 16'h0000 = constant zero
     // 16'hFFFF = constant one
-    //
-    // =========================================================
 
     function automatic logic route_select (
         input logic [3:0] select,
@@ -177,9 +175,6 @@ module tinyfpga (
     // =========================================================
     // SHARED COUNTER / PWM TIMEBASE
     // =========================================================
-
-    // Period = configured value + 1 clock cycles.
-    // Counter and PWM share the same timebase.
 
     always_ff @(posedge clk) begin
 
