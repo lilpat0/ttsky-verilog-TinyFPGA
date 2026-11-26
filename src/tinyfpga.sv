@@ -1,3 +1,6 @@
+
+`default_nettype none
+
 module tinyfpga (
     input  logic       clk,
     input  logic       rst_n,
@@ -13,12 +16,7 @@ module tinyfpga (
     output logic [3:0] io_out
 );
 
-    // Configuration:
-    // [63:0]   Four 16-bit LUT truth tables
-    // [127:64] Sixteen 4-bit routing selectors
-    // [131:128] Four output register-mode bits
-
-    localparam CFG_BITS = 132;
+    localparam integer CFG_BITS = 132;
 
     // ---------------------------------------------------------
     // SPI synchronization
@@ -28,43 +26,28 @@ module tinyfpga (
     logic [2:0] cs_s;
     logic [1:0] mosi_s;
 
-    logic sclk_rise;
-    logic cs_active;
-    logic cs_rise;
-
-    assign sclk_rise = (sclk_s[2:1] == 2'b01);
-    assign cs_active = ~cs_s[1];
-    assign cs_rise   = (cs_s[2:1] == 2'b01);
+    wire sclk_rise = (sclk_s[2:1] == 2'b01);
+    wire cs_active = ~cs_s[1];
+    wire cs_rise   = (cs_s[2:1] == 2'b01);
 
     // ---------------------------------------------------------
-    // SPI configuration receiver
+    // Configuration receiver
+    // Single 132-bit configuration register.
     // ---------------------------------------------------------
 
-    logic [CFG_BITS-1:0] spi_rx_shift;
     logic [CFG_BITS-1:0] cfg;
-
     logic [7:0] bit_cnt;
-
-    // Shift incoming configuration data.
-    // Configuration is committed only after exactly 132 bits.
-
-    always_ff @(posedge clk) begin
-        if (rst_n && cs_active && sclk_rise) begin
-            spi_rx_shift <= {
-                spi_rx_shift[CFG_BITS-2:0],
-                mosi_s[1]
-            };
-        end
-    end
+    logic cfg_valid;
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            sclk_s  <= 3'b000;
-            cs_s    <= 3'b111;
-            mosi_s  <= 2'b00;
+            sclk_s    <= 3'b000;
+            cs_s      <= 3'b111;
+            mosi_s    <= 2'b00;
 
-            bit_cnt <= 8'd0;
-            cfg     <= {CFG_BITS{1'b0}};
+            cfg       <= {CFG_BITS{1'b0}};
+            bit_cnt   <= 8'd0;
+            cfg_valid <= 1'b0;
         end else begin
 
             // Synchronize SPI inputs
@@ -72,31 +55,39 @@ module tinyfpga (
             cs_s   <= {cs_s[1:0], spi_cs_n};
             mosi_s <= {mosi_s[0], spi_mosi};
 
-            // Count received SPI bits
+            // Shift directly into the active configuration.
+            if (cs_active && sclk_rise) begin
+                cfg <= {cfg[CFG_BITS-2:0], mosi_s[1]};
+            end
+
+            // Count all incoming bits.
+            // Saturate rather than stop at 132 so 133 bits
+            // cannot accidentally be accepted.
             if (!cs_active) begin
                 bit_cnt <= 8'd0;
-            end
-            else if (sclk_rise && bit_cnt < 8'd132) begin
+            end else if (sclk_rise && bit_cnt != 8'hFF) begin
                 bit_cnt <= bit_cnt + 8'd1;
             end
 
-            // Commit configuration after exactly 132 bits
-            if (cs_rise && bit_cnt == 8'd132) begin
-                cfg <= spi_rx_shift;
+            // Disable outputs while a new configuration is sent.
+            if (cs_active) begin
+                cfg_valid <= 1'b0;
+            end
+
+            // Accept only exactly 132 bits.
+            if (cs_rise) begin
+                cfg_valid <= (bit_cnt == 8'd132);
             end
         end
     end
 
-    // Write-only SPI interface
     assign spi_miso = 1'b0;
 
     // ---------------------------------------------------------
     // Configuration decode
     // ---------------------------------------------------------
 
-    logic [3:0] reg_mode;
-
-    assign reg_mode = cfg[131:128];
+    wire [3:0] reg_mode = cfg[131:128];
 
     // ---------------------------------------------------------
     // Routing selector
@@ -107,7 +98,6 @@ module tinyfpga (
         input logic [7:0] external_inputs,
         input logic [3:0] internal_outputs
     );
-
         begin
             case (select)
                 4'd0:  route_select = external_inputs[0];
@@ -129,7 +119,6 @@ module tinyfpga (
                 default: route_select = 1'b0;
             endcase
         end
-
     endfunction
 
     // ---------------------------------------------------------
@@ -137,7 +126,7 @@ module tinyfpga (
     // ---------------------------------------------------------
 
     logic [3:0] lut_q;
-    logic [3:0] lut_result;
+    wire  [3:0] lut_result;
 
     genvar i;
     genvar j;
@@ -171,15 +160,23 @@ module tinyfpga (
     // ---------------------------------------------------------
 
     always_ff @(posedge clk) begin
-        if (!rst_n) begin
+        if (!rst_n || !cfg_valid) begin
             lut_q <= 4'b0000;
         end else begin
             lut_q <= lut_result;
         end
     end
 
-    // Select registered or combinational LUT output
-    assign io_out = (reg_mode & lut_q) |
-                    ((~reg_mode) & lut_result);
+    // ---------------------------------------------------------
+    // Fabric outputs
+    // ---------------------------------------------------------
+
+    wire [3:0] fabric_result =
+        (reg_mode & lut_q) |
+        ((~reg_mode) & lut_result);
+
+    assign io_out = cfg_valid ? fabric_result : 4'b0000;
 
 endmodule
+
+`default_nettype wire
