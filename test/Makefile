@@ -6,7 +6,12 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v
+
+# Order does not matter to Icarus, but keep the core first.
+PROJECT_SOURCES = tinyfpga.sv project.sv
+
+# The design is SystemVerilog (logic, always_ff, return in functions, ...)
+COMPILE_ARGS += -g2012
 
 ifneq ($(GATES),yes)
 
