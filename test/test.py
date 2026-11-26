@@ -1,11 +1,17 @@
+
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, Timer
 
 CFG_BITS = 164
+CLOCK_PERIOD_NS = 100
+SETTLE_NS = 10
 SPI_HALF = 4
 
-# Routing selectors
+# ============================================================
+# ROUTING SELECTORS
+# ============================================================
+
 R_EXT0 = 0
 R_EXT1 = 1
 R_EXT2 = 2
@@ -16,15 +22,16 @@ R_EXT6 = 6
 R_EXT7 = 7
 
 R_Q = [8, 9, 10, 11]
+
 R_COUNTER_MSB = 12
 R_COUNTER_TICK = 13
 R_SHIFT_MSB = 14
 R_PWM = 15
 
 
-# ------------------------------------------------------------
-# TinyTapeout pin helpers
-# ------------------------------------------------------------
+# ============================================================
+# TINY TAPEOUT PIN HELPERS
+# ============================================================
 
 def set_spi_pins(dut, sclk=0, cs_n=1, mosi=0):
     value = (
@@ -43,15 +50,19 @@ def read_miso(dut):
     return (int(dut.uio_out.value) >> 3) & 1
 
 
+# ============================================================
+# CLOCK AND SETTLING
+# ============================================================
+
 async def cycles(dut, count=1):
     for _ in range(count):
         await RisingEdge(dut.clk)
-        await Timer(1, unit="ns")
+        await Timer(SETTLE_NS, unit="ns")
 
 
-# ------------------------------------------------------------
-# 164-bit configuration builder
-# ------------------------------------------------------------
+# ============================================================
+# CONFIGURATION BUILDER
+# ============================================================
 
 def build_cfg(
     luts,
@@ -64,14 +75,15 @@ def build_cfg(
     shift_enable=0,
     shift_dir=0,
     pwm_duty=0,
-    pwm_enable=0,
+    pwm_enable=0
 ):
+
     assert len(luts) == 4
     assert len(routes) == 4
 
     cfg = 0
 
-    # Four 16-bit LUT truth tables [63:0]
+    # Four LUT truth tables [63:0]
     for i, truth_table in enumerate(luts):
         assert 0 <= truth_table <= 0xFFFF
         cfg |= truth_table << (16 * i)
@@ -85,18 +97,22 @@ def build_cfg(
             position = 64 + (i * 4 + j) * 4
             cfg |= selector << position
 
-    # Four LUT register modes [131:128]
+    # Register modes [131:128]
     assert 0 <= reg_mode <= 0xF
     cfg |= reg_mode << 128
 
-    # Shared counter/PWM period and counter enable [140:132]
+    # Counter period [139:132]
+    # Counter enable [140]
     assert 0 <= counter_period <= 255
     assert counter_enable in (0, 1)
 
     cfg |= counter_period << 132
     cfg |= counter_enable << 140
 
-    # Shift register [154:141]
+    # Shift register initial value [148:141]
+    # Shift input selector [152:149]
+    # Shift enable [153]
+    # Shift direction [154]
     assert 0 <= shift_init <= 255
     assert 0 <= shift_input <= 15
     assert shift_enable in (0, 1)
@@ -107,7 +123,8 @@ def build_cfg(
     cfg |= shift_enable << 153
     cfg |= shift_dir << 154
 
-    # PWM duty and enable [163:155]
+    # PWM duty [162:155]
+    # PWM enable [163]
     assert 0 <= pwm_duty <= 255
     assert pwm_enable in (0, 1)
 
@@ -119,9 +136,9 @@ def build_cfg(
     return cfg
 
 
-# ------------------------------------------------------------
-# SPI Mode 0, MSB first
-# ------------------------------------------------------------
+# ============================================================
+# SPI MODE 0, MSB FIRST
+# ============================================================
 
 async def spi_write(dut, value, nbits=CFG_BITS):
 
@@ -129,17 +146,18 @@ async def spi_write(dut, value, nbits=CFG_BITS):
     assert value >= 0
 
     set_spi_pins(dut, sclk=0, cs_n=0, mosi=0)
+
     await cycles(dut, 8)
 
     for bit in range(nbits - 1, -1, -1):
 
         mosi = (value >> bit) & 1
 
-        # Data stable before sampling edge
+        # Data stable before rising edge
         set_spi_pins(dut, sclk=0, cs_n=0, mosi=mosi)
         await cycles(dut, SPI_HALF)
 
-        # Rising edge: receiver sampling edge
+        # SPI Mode 0 sampling edge
         set_spi_pins(dut, sclk=1, cs_n=0, mosi=mosi)
         await cycles(dut, SPI_HALF)
 
@@ -148,13 +166,15 @@ async def spi_write(dut, value, nbits=CFG_BITS):
 
     await cycles(dut, 8)
 
+    # End configuration transaction
     set_spi_pins(dut, sclk=0, cs_n=1, mosi=0)
+
     await cycles(dut, 10)
 
 
-# ------------------------------------------------------------
-# Reset and configuration helpers
-# ------------------------------------------------------------
+# ============================================================
+# RESET AND INITIALIZATION
+# ============================================================
 
 async def start(dut):
 
@@ -165,27 +185,39 @@ async def start(dut):
 
     set_spi_pins(dut)
 
+    # Match config.yaml: 100 ns = 10 MHz
     cocotb.start_soon(
-        Clock(dut.clk, 10, unit="ns").start()
+        Clock(
+            dut.clk,
+            CLOCK_PERIOD_NS,
+            unit="ns"
+        ).start()
     )
 
     await cycles(dut, 5)
 
     dut.rst_n.value = 1
+
     await cycles(dut, 10)
 
 
 async def configure(dut, luts, routes, reg_mode=0, **kwargs):
 
-    cfg = build_cfg(luts, routes, reg_mode, **kwargs)
+    cfg = build_cfg(
+        luts,
+        routes,
+        reg_mode,
+        **kwargs
+    )
 
     await spi_write(dut, cfg, CFG_BITS)
+
     await cycles(dut, 3)
 
 
-# ------------------------------------------------------------
-# TEST 1: Reset and TinyTapeout pin mapping
-# ------------------------------------------------------------
+# ============================================================
+# TEST 1: RESET AND PIN MAPPING
+# ============================================================
 
 @cocotb.test()
 async def test_reset(dut):
@@ -196,22 +228,24 @@ async def test_reset(dut):
     assert read_miso(dut) == 0
     assert int(dut.uio_oe.value) == 0x08
 
-    dut._log.info("PASS: reset and TinyTapeout pin mapping")
+    dut._log.info(
+        "PASS: reset and TinyTapeout pin mapping"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 2: Four LUT functions
-# ------------------------------------------------------------
+# ============================================================
+# TEST 2: FOUR LUT FUNCTIONS
+# ============================================================
 
 @cocotb.test()
 async def test_lut_logic(dut):
 
     await start(dut)
 
-    # AND = 8888
-    # XOR = 6666
-    # OR  = EEEE
-    # NOT A = 5555
+    # LUT0 = A AND B
+    # LUT1 = A XOR B
+    # LUT2 = A OR B
+    # LUT3 = NOT A
 
     luts = [
         0x8888,
@@ -224,7 +258,7 @@ async def test_lut_logic(dut):
         [R_EXT0, R_EXT1, R_EXT0, R_EXT1],
         [R_EXT0, R_EXT1, R_EXT0, R_EXT1],
         [R_EXT0, R_EXT1, R_EXT0, R_EXT1],
-        [R_EXT0, R_EXT1, R_EXT0, R_EXT1],
+        [R_EXT0, R_EXT1, R_EXT0, R_EXT1]
     ]
 
     await configure(dut, luts, routes)
@@ -232,6 +266,7 @@ async def test_lut_logic(dut):
     for value in range(256):
 
         dut.ui_in.value = value
+
         await cycles(dut, 2)
 
         a = value & 1
@@ -247,16 +282,19 @@ async def test_lut_logic(dut):
         result = read_output(dut)
 
         assert result == expected, (
-            f"Input={value:02X}, Expected={expected:04b}, "
+            f"Input={value:02X}, "
+            f"Expected={expected:04b}, "
             f"Got={result:04b}"
         )
 
-    dut._log.info("PASS: all 256 input combinations")
+    dut._log.info(
+        "PASS: all 256 input combinations"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 3: Constant LUT outputs
-# ------------------------------------------------------------
+# ============================================================
+# TEST 3: CONSTANT LUT OUTPUTS
+# ============================================================
 
 @cocotb.test()
 async def test_constants(dut):
@@ -278,18 +316,19 @@ async def test_constants(dut):
     await configure(dut, luts, routes)
 
     dut.ui_in.value = 0xA5
+
     await cycles(dut, 3)
 
-    expected = 0b0101
+    assert read_output(dut) == 0b0101
 
-    assert read_output(dut) == expected
+    dut._log.info(
+        "PASS: constant LUT outputs"
+    )
 
-    dut._log.info("PASS: constant LUT outputs")
 
-
-# ------------------------------------------------------------
-# TEST 4: Registered outputs
-# ------------------------------------------------------------
+# ============================================================
+# TEST 4: REGISTERED OUTPUTS
+# ============================================================
 
 @cocotb.test()
 async def test_registered_outputs(dut):
@@ -310,27 +349,37 @@ async def test_registered_outputs(dut):
         reg_mode=0xF
     )
 
+    # Drive input high
     dut.ui_in.value = 1
 
-    await cycles(dut, 2)
+    await cycles(dut, 3)
 
     assert read_output(dut) == 0xF
 
+    # Change input without a clock edge
     dut.ui_in.value = 0
-    await Timer(1, unit="ns")
 
+    await Timer(10, unit="ns")
+
+    # Registered outputs must hold their previous state
     assert read_output(dut) == 0xF
 
-    await cycles(dut, 1)
+    # Allow multiple clock edges for GL settling
+    await cycles(dut, 3)
 
-    assert read_output(dut) == 0
+    assert read_output(dut) == 0, (
+        f"Registered output failed to update: "
+        f"Got {read_output(dut):04b}"
+    )
 
-    dut._log.info("PASS: registered output behavior")
+    dut._log.info(
+        "PASS: registered output behavior"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 5: LUT feedback
-# ------------------------------------------------------------
+# ============================================================
+# TEST 5: LUT FEEDBACK
+# ============================================================
 
 @cocotb.test()
 async def test_lut_feedback(dut):
@@ -348,7 +397,7 @@ async def test_lut_feedback(dut):
         [R_Q[0], R_EXT0, R_EXT0, R_EXT0],
         [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
         [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
-        [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
+        [R_EXT0, R_EXT0, R_EXT0, R_EXT0]
     ]
 
     await configure(
@@ -366,16 +415,20 @@ async def test_lut_feedback(dut):
 
         result = read_output(dut) & 1
 
-        assert result != previous, "Feedback LUT did not toggle"
+        assert result != previous, (
+            "Feedback LUT did not toggle"
+        )
 
         previous = result
 
-    dut._log.info("PASS: LUT feedback")
+    dut._log.info(
+        "PASS: LUT feedback"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 6: LUT-to-LUT registered pipeline
-# ------------------------------------------------------------
+# ============================================================
+# TEST 6: LUT-TO-LUT REGISTERED PIPELINE
+# ============================================================
 
 @cocotb.test()
 async def test_lut_pipeline(dut):
@@ -393,7 +446,7 @@ async def test_lut_pipeline(dut):
         [R_EXT0, R_EXT1, R_EXT0, R_EXT1],
         [R_Q[0], R_EXT1, R_Q[0], R_EXT1],
         [R_EXT0, R_EXT1, R_EXT0, R_EXT1],
-        [R_EXT0, R_EXT1, R_EXT0, R_EXT1],
+        [R_EXT0, R_EXT1, R_EXT0, R_EXT1]
     ]
 
     await configure(
@@ -415,12 +468,14 @@ async def test_lut_pipeline(dut):
 
     assert (read_output(dut) & 0x2) == 0
 
-    dut._log.info("PASS: LUT pipeline")
+    dut._log.info(
+        "PASS: LUT pipeline"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 7: One configurable counter
-# ------------------------------------------------------------
+# ============================================================
+# TEST 7: CONFIGURABLE COUNTER
+# ============================================================
 
 @cocotb.test()
 async def test_counter(dut):
@@ -433,7 +488,7 @@ async def test_counter(dut):
         [R_COUNTER_TICK, R_EXT0, R_EXT0, R_EXT0],
         [R_COUNTER_MSB, R_EXT0, R_EXT0, R_EXT0],
         [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
-        [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
+        [R_EXT0, R_EXT0, R_EXT0, R_EXT0]
     ]
 
     await configure(
@@ -456,12 +511,14 @@ async def test_counter(dut):
         f"Expected 4 counter pulses, got {pulses}"
     )
 
-    dut._log.info("PASS: configurable counter")
+    dut._log.info(
+        "PASS: configurable counter"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 8: Configurable shift register
-# ------------------------------------------------------------
+# ============================================================
+# TEST 8: CONFIGURABLE SHIFT REGISTER
+# ============================================================
 
 @cocotb.test()
 async def test_shift_register(dut):
@@ -474,7 +531,7 @@ async def test_shift_register(dut):
         [R_SHIFT_MSB, R_EXT0, R_EXT0, R_EXT0],
         [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
         [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
-        [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
+        [R_EXT0, R_EXT0, R_EXT0, R_EXT0]
     ]
 
     await configure(
@@ -489,16 +546,25 @@ async def test_shift_register(dut):
 
     dut.ui_in.value = 1
 
-    await cycles(dut, 8)
+    # Eight clock edges are required to fill the register.
+    # Additional edges provide margin for the GL model.
+    await cycles(dut, 12)
 
-    assert (read_output(dut) & 1) == 1
+    result = read_output(dut)
 
-    dut._log.info("PASS: configurable shift register")
+    assert (result & 1) == 1, (
+        f"Shift register MSB expected 1, "
+        f"got {result:04b}"
+    )
+
+    dut._log.info(
+        "PASS: configurable shift register"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 9: One configurable PWM channel
-# ------------------------------------------------------------
+# ============================================================
+# TEST 9: CONFIGURABLE PWM
+# ============================================================
 
 @cocotb.test()
 async def test_pwm(dut):
@@ -511,7 +577,7 @@ async def test_pwm(dut):
         [R_PWM, R_EXT0, R_EXT0, R_EXT0],
         [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
         [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
-        [R_EXT0, R_EXT0, R_EXT0, R_EXT0],
+        [R_EXT0, R_EXT0, R_EXT0, R_EXT0]
     ]
 
     await configure(
@@ -532,15 +598,18 @@ async def test_pwm(dut):
         high_cycles += read_output(dut) & 1
 
     assert high_cycles == 4, (
-        f"PWM expected 4 high clocks, got {high_cycles}"
+        f"PWM expected 4 high clocks, "
+        f"got {high_cycles}"
     )
 
-    dut._log.info("PASS: configurable PWM")
+    dut._log.info(
+        "PASS: configurable PWM"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 10: Invalid configuration lengths
-# ------------------------------------------------------------
+# ============================================================
+# TEST 10: INVALID CONFIGURATION LENGTHS
+# ============================================================
 
 @cocotb.test()
 async def test_bad_length_rejected(dut):
@@ -556,29 +625,31 @@ async def test_bad_length_rejected(dut):
 
     cfg = build_cfg(luts, routes)
 
-    # 163 bits must be rejected.
-    await spi_write(dut, cfg, CFG_BITS - 1)
+    # 163-bit configuration must be rejected.
+    await spi_write(dut, cfg, 163)
 
     assert read_output(dut) == 0
 
-    # 165 bits must be rejected.
-    await spi_write(dut, cfg, CFG_BITS + 1)
+    # 165-bit configuration must be rejected.
+    await spi_write(dut, cfg, 165)
 
     assert read_output(dut) == 0
 
     # Exactly 164 bits must be accepted.
-    await spi_write(dut, cfg, CFG_BITS)
+    await spi_write(dut, cfg, 164)
 
     await cycles(dut, 3)
 
     assert read_output(dut) == 0xF
 
-    dut._log.info("PASS: configuration length validation")
+    dut._log.info(
+        "PASS: configuration length validation"
+    )
 
 
-# ------------------------------------------------------------
-# TEST 11: Live reconfiguration
-# ------------------------------------------------------------
+# ============================================================
+# TEST 11: LIVE RECONFIGURATION
+# ============================================================
 
 @cocotb.test()
 async def test_reconfiguration(dut):
@@ -590,22 +661,32 @@ async def test_reconfiguration(dut):
         for _ in range(4)
     ]
 
-    # All four LUTs implement A AND B.
-    await configure(dut, [0x8888] * 4, routes)
+    # First configuration: AND
+    await configure(
+        dut,
+        [0x8888] * 4,
+        routes
+    )
 
     dut.ui_in.value = 0b00000011
 
-    await cycles(dut, 2)
+    await cycles(dut, 3)
 
     assert read_output(dut) == 0xF
 
-    # All four LUTs are reconfigured to A OR B.
-    await configure(dut, [0xEEEE] * 4, routes)
+    # Second configuration: OR
+    await configure(
+        dut,
+        [0xEEEE] * 4,
+        routes
+    )
 
     dut.ui_in.value = 0b00000001
 
-    await cycles(dut, 2)
+    await cycles(dut, 3)
 
     assert read_output(dut) == 0xF
 
-    dut._log.info("PASS: live reconfiguration")
+    dut._log.info(
+        "PASS: live reconfiguration"
+    )
